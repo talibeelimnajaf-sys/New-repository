@@ -1,4 +1,4 @@
-import json, os, urllib.parse, urllib.request
+import json, os, re, urllib.parse, urllib.request
 from datetime import datetime, timezone
 
 KEY = os.environ.get("YT_API_KEY", "")
@@ -7,6 +7,10 @@ STATE = "state.json"
 DIGEST = os.environ.get("SCHEDULE", "") == "30 15 * * *" or os.environ.get("FORCE_DIGEST") == "1"
 VIEW_JUMP = 300   # اتنے ویوز ایک چکر میں بڑھیں تو الرٹ
 SUB_JUMP = 3      # سبسکرائبرز میں اتنا اضافہ تو الرٹ (کمی میں 2 بھی)
+IGNORE = {"OCB0Kp258dI"}  # کامیاب ویڈیو: عنوان نہ بدلیں
+
+ARABIC_ONLY = set("يكةى")                # عربی رسم الخط کے حروف
+URDU_ONLY = set("یکےںٹڈڑھگچژ")          # اردو کے مخصوص حروف
 
 
 def yt(path, **p):
@@ -32,6 +36,7 @@ def snapshot():
         "videos": {
             v["id"]: {
                 "title": v["snippet"]["title"],
+                "tags": v["snippet"].get("tags", []),
                 "views": int(v["statistics"].get("viewCount", 0)),
                 "likes": int(v["statistics"].get("likeCount", 0)),
                 "comments": int(v["statistics"].get("commentCount", 0)),
@@ -66,6 +71,27 @@ def delta(a, b):
     return f"{a:,} ({d:+,})"
 
 
+def title_problems(title, tags):
+    """عنوان اور ٹیگز میں وہ مسائل جو اردو لائن سے ہٹتے ہیں۔ یہ اندازہ ہے، حتمی فیصلہ نہیں۔"""
+    p = []
+    t = title.strip()
+    if t.startswith("#"):
+        p.append("عنوان ہیش ٹیگ سے شروع ہوتا ہے")
+    has_ar = any(c in ARABIC_ONLY for c in t)
+    has_ur = any(c in URDU_ONLY for c in t)
+    if has_ar and not has_ur:
+        p.append("عنوان عربی لگتا ہے، اردو میں بنائیں")
+    if not any("\u0600" <= c <= "\u06FF" for c in t):
+        p.append("عنوان انگریزی ہے، اردو میں بنائیں")
+    if not tags:
+        p.append("ٹیگز خالی ہیں")
+    else:
+        eng = [x for x in tags if re.fullmatch(r"[A-Za-z ]+", x)]
+        if len(eng) * 2 >= len(tags):
+            p.append("زیادہ تر ٹیگز انگریزی ہیں، اردو ٹیگز رکھیں")
+    return p
+
+
 def issue(title, body):
     tok, repo = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
     if not tok or not repo:
@@ -94,6 +120,23 @@ def main():
     alerts = compare(old, new) if old else []
     if alerts:
         issue("🔔 چینل الرٹ " + new["t"], "\n".join(f"- {x}" for x in alerts))
+
+    # تجاویز: ہر ویڈیو پر ایک بار، صرف نئے مسائل
+    flagged = set(st.get("flagged", []))
+    fresh = []
+    for vid, v in new["videos"].items():
+        if vid in IGNORE or vid in flagged:
+            continue
+        probs = title_problems(v["title"], v.get("tags", []))
+        if probs:
+            fresh.append(f"- {v['title']}\n  - " + "\n  - ".join(probs) + f"\n  - https://youtu.be/{vid}")
+        flagged.add(vid)
+    if fresh:
+        issue(
+            "✏️ عنوان/ٹیگ کی تجاویز " + new["t"][:10],
+            "یہ صرف تجاویز ہیں، خودکار تبدیلی نہیں ہوئی۔ Studio میں خود بدلیں:\n\n" + "\n\n".join(fresh),
+        )
+
     if DIGEST:
         base = st.get("digest_base") or old or new
         top = sorted(new["videos"].items(), key=lambda kv: -kv[1]["views"])[:3]
@@ -112,6 +155,7 @@ def main():
         issue("📊 روزانہ رپورٹ " + new["t"][:10], "\n".join(lines))
         st["digest_base"] = new
     st["last"] = new
+    st["flagged"] = sorted(flagged)
     with open(STATE, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=1)
 
